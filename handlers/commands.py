@@ -27,6 +27,7 @@ class UI:
     ACTIVE_GENRE_PROMPT: str = "Какой жанр сделать (не)активным?"
 
     ERR_ADMIN_ONLY: str = "Эта команда доступна только администраторам"
+    ERR_PRIVATE_ONLY: str = "Эта команда доступна только в ЛС"
     ERR_ACCESS_CHECK: str = "Ошибка при проверке прав доступа"
     ERR_EMPTY: str = "Пустое сообщение. Попробуйте ещё раз: {cmd}"
     ERR_TOO_LONG: str = "Слишком длинно. Сократите и отправьте снова: {cmd}"
@@ -53,18 +54,125 @@ class PendingAction:
 
 USER_DATA_KEY = "pending_action"
 USER_DATA_PROMPT_MSG_ID = "pending_prompt_message_id"
+USER_DATA_SELECTED_CHAT_ID = "selected_chat_id"
 
 
 # ====== Вспомогательные функции ======
 
+def _is_private(update: Update) -> bool:
+    chat = update.effective_chat
+    return bool(chat and getattr(chat, "type", None) == "private")
+
+
+def _get_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Возвращает chat_id, с которым должны работать команды.
+
+    Правила:
+    - в ЛС: используем выбранный чат из user_data['selected_chat_id'] (по умолчанию — id ЛС)
+    - в группе: выбранный чат всегда равен id группы
+    """
+    chat = update.effective_chat
+    if not chat:
+        raise ValueError("No effective_chat in update")
+
+    if _is_private(update):
+        private_chat_id = chat.id
+        selected_chat_id = context.user_data.get(USER_DATA_SELECTED_CHAT_ID, private_chat_id)
+        context.user_data[USER_DATA_SELECTED_CHAT_ID] = selected_chat_id
+        return selected_chat_id
+
+    # В группах выбранный чат всегда равен id текущей группы
+    context.user_data[USER_DATA_SELECTED_CHAT_ID] = chat.id
+    return chat.id
+
+
+def _get_chat_title_for_selected_chat_id(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    selected_chat_id: int,
+) -> str:
+    """
+    Для ЛС: возвращает название выбранного чата.
+    - если выбран id ЛС -> "Приватная беседа"
+    - иначе -> title группы из БД (таблица groups), если есть
+    """
+    private_chat = update.effective_chat
+    if private_chat and selected_chat_id == private_chat.id:
+        return "Приватная беседа"
+
+    db: Database = context.bot_data.get("database")
+    if not db:
+        from config import DB_PATH
+        db = Database(DB_PATH)
+        context.bot_data["database"] = db
+
+    group = db.get_group(selected_chat_id)
+    if group:
+        _chat_id, title, _chat_type, _is_active, _added_at, _updated_at = group
+        return title
+
+    # Фолбэк на случай, если группы нет в БД (например, бот уже не в группе)
+    return str(selected_chat_id)
+
+
 async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    chat_id = update.effective_chat.id
     user = update.effective_user
+    if not user:
+        return False
+
     try:
-        member = await context.bot.get_chat_member(chat_id, user.id)
+        chat = update.effective_chat
+        if not chat or getattr(chat, "type", None) == "private":
+            return False
+        member = await context.bot.get_chat_member(chat.id, user.id)
         return member.status in ("administrator", "creator")
     except Exception:
         return False
+
+
+async def _is_admin_or_private(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return _is_private(update) or await _is_admin(update, context)
+
+
+async def _is_admin_in_chat(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
+async def _is_admin_for_chat_id(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
+    return await _is_admin_in_chat(context, chat_id, user.id)
+
+
+async def _is_admin_or_private_for_chat_id(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+) -> bool:
+    """
+    Проверка прав для целевого чата:
+    - если команда вызвана в ЛС и целевой чат = id ЛС, то разрешаем
+    - иначе требуем админство в целевом чате
+    """
+    if _is_private(update):
+        private_chat = update.effective_chat
+        if private_chat and chat_id == private_chat.id:
+            return True
+    return await _is_admin_for_chat_id(update, context, chat_id)
 
 
 def _set_pending(context: ContextTypes.DEFAULT_TYPE, action: str, prompt_message_id: int) -> None:
@@ -115,16 +223,21 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
-    chat_id = update.effective_chat.id
     service: BookService = context.bot_data["book_service"]
-    await update.message.reply_text(service.list_books(chat_id))
+    chat_id = _get_chat_id(update, context)
+    text = service.list_books(chat_id)
+    if _is_private(update):
+        chat_title = _get_chat_title_for_selected_chat_id(update, context, chat_id)
+        text = f"{chat_title}\n\n{text}"
+    await update.message.reply_text(text)
 
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
-    if not await _is_admin(update, context):
+    chat_id = _get_chat_id(update, context)
+    if not await _is_admin_or_private_for_chat_id(update, context, chat_id):
         await update.message.reply_text(ui.ERR_ADMIN_ONLY)
         return
 
@@ -161,16 +274,21 @@ async def genres_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = _get_chat_id(update, context)
     service: GenreService = context.bot_data["genre_service"]
-    await update.message.reply_text(service.list_genres(chat_id))
+    text = service.list_genres(chat_id)
+    if _is_private(update):
+        chat_title = _get_chat_title_for_selected_chat_id(update, context, chat_id)
+        text = f"{chat_title}\n\n{text}"
+    await update.message.reply_text(text)
 
 
 async def addgenre_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
-    if not await _is_admin(update, context):
+    chat_id = _get_chat_id(update, context)
+    if not await _is_admin_or_private_for_chat_id(update, context, chat_id):
         await update.message.reply_text(ui.ERR_ADMIN_ONLY)
         return
 
@@ -182,7 +300,8 @@ async def deletegenre_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not update.message:
         return
 
-    if not await _is_admin(update, context):
+    chat_id = _get_chat_id(update, context)
+    if not await _is_admin_or_private_for_chat_id(update, context, chat_id):
         await update.message.reply_text(ui.ERR_ADMIN_ONLY)
         return
 
@@ -194,7 +313,8 @@ async def activegenre_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not update.message:
         return
 
-    if not await _is_admin(update, context):
+    chat_id = _get_chat_id(update, context)
+    if not await _is_admin_or_private_for_chat_id(update, context, chat_id):
         await update.message.reply_text(ui.ERR_ADMIN_ONLY)
         return
 
@@ -206,7 +326,8 @@ async def resetgenres_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not update.message:
         return
 
-    if not await _is_admin(update, context):
+    chat_id = _get_chat_id(update, context)
+    if not await _is_admin_or_private_for_chat_id(update, context, chat_id):
         await update.message.reply_text(ui.ERR_ADMIN_ONLY)
         return
 
@@ -227,9 +348,13 @@ async def chats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
-    if not await _is_admin(update, context):
-        await update.message.reply_text(ui.ERR_ADMIN_ONLY)
+    if not _is_private(update):
+        await update.message.reply_text(ui.ERR_PRIVATE_ONLY)
         return
+
+    private_chat_id = update.effective_chat.id
+    if USER_DATA_SELECTED_CHAT_ID not in context.user_data:
+        context.user_data[USER_DATA_SELECTED_CHAT_ID] = private_chat_id
 
     # Получаем базу данных из bot_data
     db: Database = context.bot_data.get("database")
@@ -238,28 +363,101 @@ async def chats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db = Database(DB_PATH)
         context.bot_data["database"] = db
 
-    # Получаем все группы (включая неактивные)
-    groups = db.get_all_groups(active_only=False)
-    
-    if not groups:
-        await update.message.reply_text("Список чатов пуст")
+    # Показываем только активные группы (is_active=1)
+    groups = db.get_all_groups(active_only=True)
+
+    selected_chat_id = context.user_data.get(USER_DATA_SELECTED_CHAT_ID)
+    active_group_ids = {chat_id for chat_id, *_ in groups} if groups else set()
+    if selected_chat_id != private_chat_id and selected_chat_id not in active_group_ids:
+        # Если ранее был выбран неактивный/недоступный чат — сбрасываем на приватную беседу
+        selected_chat_id = private_chat_id
+        context.user_data[USER_DATA_SELECTED_CHAT_ID] = selected_chat_id
+    check = "✅ "
+
+    keyboard: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(
+            f"{check}Приватная беседа" if selected_chat_id == private_chat_id else "Приватная беседа",
+            callback_data="chats:select:private",
+        )]
+    ]
+
+    if groups:
+        for chat_id, title, chat_type, _is_active, _added_at, _updated_at in groups:
+            type_text = "супергруппа" if chat_type == "supergroup" else "группа"
+            label = f"{title} ({type_text})"
+            if selected_chat_id == chat_id:
+                label = f"{check}{label}"
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"chats:select:{chat_id}")])
+
+    await update.message.reply_text("Список чатов:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def handle_chats_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
         return
 
-    lines = []
-    for chat_id, title, chat_type, is_active, added_at, updated_at in groups:
-        status_emoji = "🟢" if is_active else "🔴"
-        type_text = "супергруппа" if chat_type == "supergroup" else "группа"
-        lines.append(f"{status_emoji} {title} ({type_text}, ID: {chat_id})")
-    
-    result = "Список чатов:\n\n" + "\n".join(lines)
-    await update.message.reply_text(result)
+    await query.answer()
+
+    # На всякий случай — выбор чатов делаем только из ЛС
+    if not _is_private(update):
+        await query.edit_message_text(ui.ERR_PRIVATE_ONLY)
+        return
+
+    private_chat_id = update.effective_chat.id
+
+    data = getattr(query, "data", None) or ""
+    parts = data.split(":")
+    if len(parts) != 3 or parts[0] != "chats" or parts[1] != "select":
+        return
+
+    raw = parts[2]
+    if raw == "private":
+        selected_chat_id = private_chat_id
+        context.user_data[USER_DATA_SELECTED_CHAT_ID] = selected_chat_id
+    else:
+        try:
+            selected_chat_id = int(raw)
+        except ValueError:
+            return
+        context.user_data[USER_DATA_SELECTED_CHAT_ID] = selected_chat_id
+
+    # Перерисовываем список с галочкой
+    db: Database = context.bot_data.get("database")
+    if not db:
+        from config import DB_PATH
+        db = Database(DB_PATH)
+        context.bot_data["database"] = db
+
+    # Показываем только активные группы (is_active=1)
+    groups = db.get_all_groups(active_only=True)
+    active_group_ids = {chat_id for chat_id, *_ in groups} if groups else set()
+    if selected_chat_id != private_chat_id and selected_chat_id not in active_group_ids:
+        selected_chat_id = private_chat_id
+        context.user_data[USER_DATA_SELECTED_CHAT_ID] = selected_chat_id
+    check = "✅ "
+    keyboard: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(
+            f"{check}Приватная беседа" if selected_chat_id == private_chat_id else "Приватная беседа",
+            callback_data="chats:select:private",
+        )]
+    ]
+    if groups:
+        for chat_id, title, chat_type, _is_active, _added_at, _updated_at in groups:
+            type_text = "супергруппа" if chat_type == "supergroup" else "группа"
+            label = f"{title} ({type_text})"
+            if selected_chat_id == chat_id:
+                label = f"{check}{label}"
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"chats:select:{chat_id}")])
+
+    await query.edit_message_text("Список чатов:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def choose_book_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = _get_chat_id(update, context)
     service: BookService = context.bot_data["book_service"]
 
     if not service.has_books(chat_id):
@@ -301,7 +499,7 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if prompt_msg_id and update.message.reply_to_message.message_id != prompt_msg_id:
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = _get_chat_id(update, context)
     user = update.effective_user
     text = update.message.text.strip()
 
@@ -338,7 +536,7 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             # админ может удалить любую; обычный — только свою (логика в сервисе)
-            is_admin = await _is_admin(update, context)
+            is_admin = await _is_admin_or_private_for_chat_id(update, context, chat_id)
 
             service: BookService = context.bot_data["book_service"]
             success, msg = service.delete_book(chat_id, idx, user.id, is_admin)
@@ -373,7 +571,7 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # /addgenre
         if pending == PendingAction.ADD_GENRE:
-            if not await _is_admin(update, context):
+            if not await _is_admin_or_private_for_chat_id(update, context, chat_id):
                 await update.message.reply_text(ui.ERR_ADMIN_ONLY)
                 return
 
@@ -392,7 +590,7 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # /deletegenre
         if pending == PendingAction.DELETE_GENRE:
-            if not await _is_admin(update, context):
+            if not await _is_admin_or_private_for_chat_id(update, context, chat_id):
                 await update.message.reply_text(ui.ERR_ADMIN_ONLY)
                 return
 
@@ -420,7 +618,7 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # /activegenre
         if pending == PendingAction.ACTIVE_GENRE:
-            if not await _is_admin(update, context):
+            if not await _is_admin_or_private_for_chat_id(update, context, chat_id):
                 await update.message.reply_text(ui.ERR_ADMIN_ONLY)
                 return
 
@@ -459,11 +657,11 @@ async def handle_books_callbacks(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     await query.answer()
-    chat_id = update.effective_chat.id
+    chat_id = _get_chat_id(update, context)
     data = getattr(query, 'data', None) or ""
 
     if data == "books:clear:confirm":
-        if not await _is_admin(update, context):
+        if not await _is_admin_or_private_for_chat_id(update, context, chat_id):
             await query.edit_message_text(ui.ERR_ADMIN_ONLY)
             return
         service: BookService = context.bot_data["book_service"]
@@ -489,7 +687,7 @@ async def handle_books_callbacks(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     if data == "genres:reset:confirm":
-        if not await _is_admin(update, context):
+        if not await _is_admin_or_private_for_chat_id(update, context, chat_id):
             await query.edit_message_text(ui.ERR_ADMIN_ONLY)
             return
         service: GenreService = context.bot_data["genre_service"]
@@ -509,7 +707,7 @@ async def pollbook_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = _get_chat_id(update, context)
     service: BookService = context.bot_data["book_service"]
 
     book_titles, month_name = service.get_books_for_poll(chat_id)
@@ -540,7 +738,7 @@ async def handle_poll_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     await query.answer()
-    chat_id = update.effective_chat.id
+    chat_id = _get_chat_id(update, context)
     data = getattr(query, 'data', None) or ""
 
     # poll book
@@ -582,7 +780,7 @@ async def handle_poll_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
 
     # poll genre
     if data in ("poll:genre:confirm", "poll:genre:cancel"):
-        if not await _is_admin(update, context):
+        if not await _is_admin_or_private_for_chat_id(update, context, chat_id):
             await query.edit_message_text(ui.ERR_ADMIN_ONLY)
             return
 
@@ -628,11 +826,11 @@ async def pollgenre_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
 
-    if not await _is_admin(update, context):
+    chat_id = _get_chat_id(update, context)
+    if not await _is_admin_or_private_for_chat_id(update, context, chat_id):
         await update.message.reply_text(ui.ERR_ADMIN_ONLY)
         return
 
-    chat_id = update.effective_chat.id
     service: GenreService = context.bot_data["genre_service"]
 
     genre_titles, month_name = service.get_genres_for_poll(chat_id)

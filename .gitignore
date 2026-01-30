@@ -4,3 +4,5 @@
 __pycache__/
 .idea/
 .vscode/
+members.*.csv
+user_session.session
