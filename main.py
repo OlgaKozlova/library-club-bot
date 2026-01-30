@@ -18,6 +18,7 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ChatMemberHandler,
+    MessageReactionHandler,
     filters,
 )
 
@@ -46,6 +47,16 @@ from handlers.commands import (
     handle_my_chat_member,
     chats_command,
     handle_chats_callbacks,
+    init_users_command,
+    users_command,
+    reset_users_command,
+    handle_users_callbacks,
+    handle_user_membership_update,
+    handle_any_message_activity,
+    handle_any_callback_activity,
+    handle_any_reaction_activity,
+    flush_user_activity_buffer,
+    start_user_activity_flush_loop,
 )
 
 async def post_init(app: Application):
@@ -53,6 +64,9 @@ async def post_init(app: Application):
     app.bot_data["database"] = db
     app.bot_data["book_service"] = BookService(db)
     app.bot_data["genre_service"] = GenreService(db)
+
+    # Flush активности пользователей раз в минуту (батч в SQLite) без JobQueue
+    start_user_activity_flush_loop(app, interval_seconds=60)
 
     bot_suggest_command = BotCommand("suggest", "Предложить книгу")
     bot_list_command = BotCommand("list", "Показать список предложений")
@@ -63,6 +77,9 @@ async def post_init(app: Application):
     bot_pollbook_command = BotCommand("pollbook", "Создать опрос с книгами")
     bot_pollgenre_command = BotCommand("pollgenre", "Создать опрос с жанрами")
     bot_chats_command = BotCommand("chats", "Показать список чатов")
+    bot_init_users_command = BotCommand("init_users", "Импортировать пользователей из CSV")
+    bot_users_command = BotCommand("users", "Пользователи (удаление по неактивности)")
+    bot_reset_users_command = BotCommand("reset_users", "Сбросить список пользователей для выбранного чата")
     bot_clear_command = BotCommand("clear", "Очистить список предложений")
     bot_addgenre_command = BotCommand("addgenre", "Добавить жанр")
     bot_deletegenre_command = BotCommand("deletegenre", "Удалить жанр")
@@ -111,6 +128,9 @@ async def post_init(app: Application):
         bot_activegenre_command,
         bot_resetgenres_command,
         bot_chats_command,
+        bot_init_users_command,
+        bot_users_command,
+        bot_reset_users_command,
     ]
     await app.bot.set_my_commands(private_commands, scope=BotCommandScopeAllPrivateChats())
 
@@ -133,14 +153,31 @@ def main():
     application.add_handler(CommandHandler("pollbook", pollbook_command))
     application.add_handler(CommandHandler("pollgenre", pollgenre_command))
     application.add_handler(CommandHandler("chats", chats_command))
+    application.add_handler(CommandHandler("init_users", init_users_command))
+    application.add_handler(CommandHandler("users", users_command))
+    application.add_handler(CommandHandler("reset_users", reset_users_command))
 
     # Callback-и кнопок (InlineKeyboard)
     application.add_handler(CallbackQueryHandler(handle_books_callbacks, pattern=r"^(books:|suggest:|genres:)"))
     application.add_handler(CallbackQueryHandler(handle_poll_callbacks, pattern=r"^poll:"))
     application.add_handler(CallbackQueryHandler(handle_chats_callbacks, pattern=r"^chats:"))
+    application.add_handler(CallbackQueryHandler(handle_users_callbacks, pattern=r"^users:"))
 
     # Reply (ForceReply). Должен быть после команд, чтобы не перехватывать команды.
     application.add_handler(MessageHandler(filters.TEXT & filters.REPLY, handle_reply))
+
+    # Обновление user_activity при входе/выходе участников
+    application.add_handler(
+        MessageHandler(
+            filters.StatusUpdate.NEW_CHAT_MEMBERS | filters.StatusUpdate.LEFT_CHAT_MEMBER,
+            handle_user_membership_update,
+        )
+    )
+
+    # Активность по любым сообщениям/кнопкам (в группах). В отдельной группе, чтобы не ломать команды.
+    application.add_handler(MessageHandler(filters.ALL, handle_any_message_activity), group=1)
+    application.add_handler(CallbackQueryHandler(handle_any_callback_activity), group=1)
+    application.add_handler(MessageReactionHandler(handle_any_reaction_activity), group=1)
 
     # Обработчик событий группы (добавление/удаление бота, изменение прав)
     application.add_handler(ChatMemberHandler(handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))

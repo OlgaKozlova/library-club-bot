@@ -1,6 +1,11 @@
 import random
+import asyncio
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
+from datetime import datetime
+
+import csv
+import io
 
 from telegram import (
     Update,
@@ -9,10 +14,146 @@ from telegram import (
     InlineKeyboardButton,
 )
 from telegram.ext import ContextTypes
+from telegram.error import BadRequest, Forbidden
 
 from services.book_service import BookService
 from services.genre_service import GenreService
 from storage.database import Database
+
+
+# ====== user_activity batching ======
+
+BOT_DATA_ACTIVITY_BUFFER = "activity_buffer"
+BOT_DATA_ACTIVITY_LOCK = "activity_lock"
+BOT_DATA_ACTIVITY_FLUSH_TASK = "activity_flush_task"
+
+
+def _get_activity_lock(app) -> asyncio.Lock:
+    lock = app.bot_data.get(BOT_DATA_ACTIVITY_LOCK)
+    if not lock:
+        lock = asyncio.Lock()
+        app.bot_data[BOT_DATA_ACTIVITY_LOCK] = lock
+    return lock
+
+
+def _get_activity_buffer(app) -> dict[tuple[int, int], Optional[str]]:
+    buf = app.bot_data.get(BOT_DATA_ACTIVITY_BUFFER)
+    if not buf:
+        buf = {}
+        app.bot_data[BOT_DATA_ACTIVITY_BUFFER] = buf
+    return buf
+
+
+async def _buffer_user_activity(chat_id: int, user_id: int, username: Optional[str], context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Пишем активность в память (без записи в БД).
+    В flush будем ставить last_activity_at=CURRENT_TIMESTAMP.
+    """
+    app = context.application
+    lock = _get_activity_lock(app)
+    async with lock:
+        buf = _get_activity_buffer(app)
+        # сохраняем последний username, если он есть
+        if username:
+            buf[(chat_id, user_id)] = username
+        else:
+            buf.setdefault((chat_id, user_id), None)
+
+
+async def flush_user_activity_buffer(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Flush: пишет накопленное в SQLite пачкой."""
+    app = context.application
+    lock = _get_activity_lock(app)
+    async with lock:
+        buf = _get_activity_buffer(app)
+        if not buf:
+            return
+        snapshot = buf
+        app.bot_data[BOT_DATA_ACTIVITY_BUFFER] = {}
+
+    rows = [(chat_id, user_id, username) for (chat_id, user_id), username in snapshot.items()]
+    if not rows:
+        return
+
+    db: Database = app.bot_data.get("database")
+    if not db:
+        from config import DB_PATH
+        db = Database(DB_PATH)
+        app.bot_data["database"] = db
+
+    db.upsert_user_activity_many(rows)
+
+
+def start_user_activity_flush_loop(app, *, interval_seconds: int = 60) -> None:
+    """
+    Запускает бесконечный flush-цикл без JobQueue.
+    """
+    if app.bot_data.get(BOT_DATA_ACTIVITY_FLUSH_TASK):
+        return
+
+    async def _loop() -> None:
+        while True:
+            await asyncio.sleep(interval_seconds)
+            # создаём минимальный контекст-объект-обёртку: нам нужен только .application
+            class _Ctx:
+                __slots__ = ("application",)
+                def __init__(self, application): self.application = application
+            await flush_user_activity_buffer(_Ctx(app))  # type: ignore[arg-type]
+
+    # Не используем Application.create_task до running-состояния приложения,
+    # иначе PTB показывает warning и не будет автоматически await'ить задачу.
+    app.bot_data[BOT_DATA_ACTIVITY_FLUSH_TASK] = asyncio.create_task(_loop())
+
+
+async def handle_any_message_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Отмечает last_activity_at для любого сообщения пользователя в группе/супергруппе.
+    Не отвечает в чат — только буферизует.
+    """
+    if not update.message:
+        return
+
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or chat.type not in ("group", "supergroup") or not user:
+        return
+    if getattr(user, "is_bot", False):
+        return
+
+    await _buffer_user_activity(chat.id, user.id, getattr(user, "username", None), context)
+
+
+async def handle_any_callback_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмечает активность по кликам на inline-кнопки (в группах)."""
+    query = update.callback_query
+    if not query:
+        return
+
+    msg = getattr(query, "message", None)
+    chat = getattr(msg, "chat", None) if msg else None
+    user = getattr(query, "from_user", None)
+    if not chat or chat.type not in ("group", "supergroup") or not user:
+        return
+    if getattr(user, "is_bot", False):
+        return
+
+    await _buffer_user_activity(chat.id, user.id, getattr(user, "username", None), context)
+
+
+async def handle_any_reaction_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмечает активность по реакциям (лайкам) на сообщения в группах."""
+    mr = getattr(update, "message_reaction", None)
+    if not mr:
+        return
+
+    chat = getattr(mr, "chat", None)
+    user = getattr(mr, "user", None)
+    if not chat or chat.type not in ("group", "supergroup") or not user:
+        return
+    if getattr(user, "is_bot", False):
+        return
+
+    await _buffer_user_activity(chat.id, user.id, getattr(user, "username", None), context)
 
 
 # ====== UI текст/ключи (чтобы не завязываться на сравнение строк) ======
@@ -25,6 +166,16 @@ class UI:
     ADD_GENRE_PROMPT: str = "Введите название жанра:"
     DELETE_GENRE_PROMPT: str = "Введите номер жанра для удаления:"
     ACTIVE_GENRE_PROMPT: str = "Какой жанр сделать (не)активным?"
+    INIT_USERS_PROMPT: str = (
+        "Пришлите CSV со строкой заголовка (как в members.*.csv).\n"
+        "Можно просто вставить текст CSV сюда.\n\n"
+        "Для отмены отправьте `-`."
+    )
+    USERS_TITLE: str = "Пользователи"
+    USERS_ERR_SELECT_GROUP: str = "Выберите групповой чат через /chats (сейчас выбран ЛС)."
+    USERS_ERR_NEED_ADMIN: str = "Чтобы удалять пользователей, вы должны быть админом в выбранном чате."
+    RESET_USERS_CONFIRM: str = "Удалить все данные о пользователях для чата '{chat_title}'?"
+    RESET_USERS_DONE: str = "Удалено записей: {count}"
 
     ERR_ADMIN_ONLY: str = "Эта команда доступна только администраторам"
     ERR_PRIVATE_ONLY: str = "Эта команда доступна только в ЛС"
@@ -50,6 +201,7 @@ class PendingAction:
     ADD_GENRE = "add_genre"
     DELETE_GENRE = "delete_genre"
     ACTIVE_GENRE = "active_genre"
+    INIT_USERS = "init_users"
 
 
 USER_DATA_KEY = "pending_action"
@@ -392,6 +544,230 @@ async def chats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Список чатов:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
+async def init_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    if not _is_private(update):
+        await update.message.reply_text(ui.ERR_PRIVATE_ONLY)
+        return
+
+    sent = await update.message.reply_text(ui.INIT_USERS_PROMPT, reply_markup=ForceReply(selective=True))
+    _set_pending(context, PendingAction.INIT_USERS, sent.message_id)
+
+
+def _users_filters_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("Все", callback_data="users:filter:all"),
+            InlineKeyboardButton("Неактивные месяц", callback_data="users:filter:1"),
+        ], [
+            InlineKeyboardButton("Неактивные 3 месяца", callback_data="users:filter:3"),
+            InlineKeyboardButton("Неактивные полгода", callback_data="users:filter:6"),
+        ]]
+    )
+
+
+def _users_list_keyboard(users: List[Tuple[int, Optional[str], Optional[str]]]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    for user_id, username, last_activity_at in users:
+        label = username or f"id:{user_id}"
+        if last_activity_at:
+            try:
+                # SQLite обычно возвращает "YYYY-MM-DD HH:MM:SS"
+                dt = datetime.strptime(last_activity_at, "%Y-%m-%d %H:%M:%S")
+                ts = dt.strftime("%d.%m.%Y %H:%M")
+            except Exception:
+                ts = last_activity_at
+        else:
+            ts = "—"
+        label = f"{label} - {ts}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"users:user:{user_id}")])
+    # кнопка "назад к фильтрам"
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="users:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _users_confirm_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("Да", callback_data=f"users:confirm:{user_id}"),
+            InlineKeyboardButton("Нет", callback_data="users:cancel"),
+        ]]
+    )
+
+
+def _reset_users_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("Да", callback_data="users:reset:confirm"),
+            InlineKeyboardButton("Нет", callback_data="users:reset:cancel"),
+        ]]
+    )
+
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    if not _is_private(update):
+        await update.message.reply_text(ui.ERR_PRIVATE_ONLY)
+        return
+
+    chat_id = _get_chat_id(update, context)
+    private_chat_id = update.effective_chat.id
+    if chat_id == private_chat_id:
+        await update.message.reply_text(ui.USERS_ERR_SELECT_GROUP)
+        return
+
+    title = _get_chat_title_for_selected_chat_id(update, context, chat_id)
+    await update.message.reply_text(f"{ui.USERS_TITLE}: {title}", reply_markup=_users_filters_keyboard())
+
+
+async def reset_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    if not _is_private(update):
+        await update.message.reply_text(ui.ERR_PRIVATE_ONLY)
+        return
+
+    chat_id = _get_chat_id(update, context)
+    private_chat_id = update.effective_chat.id
+    if chat_id == private_chat_id:
+        await update.message.reply_text(ui.USERS_ERR_SELECT_GROUP)
+        return
+
+    chat_title = _get_chat_title_for_selected_chat_id(update, context, chat_id)
+    await update.message.reply_text(
+        ui.RESET_USERS_CONFIRM.format(chat_title=chat_title),
+        reply_markup=_reset_users_confirm_keyboard(),
+    )
+
+
+async def handle_users_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+
+    await query.answer()
+
+    if not _is_private(update):
+        await query.edit_message_text(ui.ERR_PRIVATE_ONLY)
+        return
+
+    data = getattr(query, "data", None) or ""
+    parts = data.split(":")
+    if len(parts) < 2 or parts[0] != "users":
+        return
+
+    chat_id = _get_chat_id(update, context)
+    private_chat_id = update.effective_chat.id
+    if chat_id == private_chat_id:
+        await query.edit_message_text(ui.USERS_ERR_SELECT_GROUP)
+        return
+
+    db: Database = context.bot_data.get("database")
+    if not db:
+        from config import DB_PATH
+        db = Database(DB_PATH)
+        context.bot_data["database"] = db
+
+    title = _get_chat_title_for_selected_chat_id(update, context, chat_id)
+
+    # users:back -> фильтры
+    if data == "users:back":
+        await query.edit_message_text(f"{ui.USERS_TITLE}: {title}", reply_markup=_users_filters_keyboard())
+        return
+
+    # users:cancel -> отмена подтверждения
+    if data == "users:cancel":
+        await query.edit_message_text(f"{ui.USERS_TITLE}: {title}", reply_markup=_users_filters_keyboard())
+        return
+
+    # users:reset:confirm|cancel
+    if data in ("users:reset:confirm", "users:reset:cancel"):
+        if data == "users:reset:cancel":
+            await query.edit_message_text(f"{ui.USERS_TITLE}: {title}", reply_markup=_users_filters_keyboard())
+            return
+
+        deleted = db.clear_user_activity(chat_id)
+        await query.edit_message_text(ui.RESET_USERS_DONE.format(count=deleted), reply_markup=_users_filters_keyboard())
+        return
+
+    # users:filter:<all|months>
+    if len(parts) == 3 and parts[1] == "filter":
+        raw = parts[2]
+        inactive_months: Optional[int]
+        if raw == "all":
+            inactive_months = None
+            subtitle = "Все"
+        else:
+            try:
+                inactive_months = int(raw)
+            except ValueError:
+                return
+            subtitle = f"Неактивные {inactive_months} мес."
+
+        users = db.get_users_for_chat(chat_id, inactive_months=inactive_months)
+        if not users:
+            await query.edit_message_text(f"{ui.USERS_TITLE}: {title}\n\n{subtitle}\n\nПусто.", reply_markup=_users_filters_keyboard())
+            return
+
+        await query.edit_message_text(
+            f"{ui.USERS_TITLE}: {title}\n\n{subtitle}\n\nВыберите пользователя:",
+            reply_markup=_users_list_keyboard(users),
+        )
+        return
+
+    # users:user:<user_id> -> confirm
+    if len(parts) == 3 and parts[1] == "user":
+        try:
+            user_id = int(parts[2])
+        except ValueError:
+            return
+
+        # найдём username для красивого текста (если нет — покажем id)
+        users = db.get_users_for_chat(chat_id, inactive_months=None)
+        username = None
+        for uid, uname, _last in users:
+            if uid == user_id:
+                username = uname
+                break
+
+        label = username or f"id:{user_id}"
+        await query.edit_message_text(f"Удалить {label} из чата '{title}'?", reply_markup=_users_confirm_keyboard(user_id))
+        return
+
+    # users:confirm:<user_id> -> kick
+    if len(parts) == 3 and parts[1] == "confirm":
+        try:
+            user_id = int(parts[2])
+        except ValueError:
+            return
+
+        # Требуем, чтобы вызывающий был админом в целевом чате
+        if not await _is_admin_for_chat_id(update, context, chat_id):
+            await query.edit_message_text(ui.USERS_ERR_NEED_ADMIN, reply_markup=_users_filters_keyboard())
+            return
+
+        try:
+            # "удалить из чата" = kick: ban + unban
+            await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+            await context.bot.unban_chat_member(chat_id=chat_id, user_id=user_id, only_if_banned=True)
+        except Forbidden:
+            await query.edit_message_text("У бота нет прав удалять участников в этом чате.", reply_markup=_users_filters_keyboard())
+            return
+        except BadRequest as e:
+            await query.edit_message_text(f"Не удалось удалить пользователя: {e.message}", reply_markup=_users_filters_keyboard())
+            return
+
+        # Успешно кикнули — удаляем из таблицы user_activity для этого чата
+        db.delete_user_activity(chat_id, user_id)
+
+        await query.edit_message_text("Пользователь удалён.", reply_markup=_users_filters_keyboard())
+        return
+
 async def handle_chats_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
@@ -510,6 +886,60 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
+        # /init_users
+        if pending == PendingAction.INIT_USERS:
+            # Базовая защита от слишком длинного текста
+            if len(text) > 50000:
+                await update.message.reply_text(ui.ERR_TOO_LONG.format(cmd="/init_users"))
+                return
+
+            # Нормализуем ввод: убираем пустые строки по краям
+            normalized = text.strip()
+            buf = io.StringIO(normalized)
+            reader = csv.DictReader(buf)
+            if not reader.fieldnames or "user_id" not in reader.fieldnames:
+                await update.message.reply_text("Не вижу колонку `user_id` в CSV.")
+                return
+
+            users: List[Tuple[int, Optional[str]]] = []
+            for row in reader:
+                raw_user_id = (row.get("user_id") or "").strip()
+                if not raw_user_id:
+                    continue
+                try:
+                    user_id_int = int(raw_user_id)
+                except ValueError:
+                    continue
+
+                # Не добавляем ботов (в members.csv is_bot обычно 0/1)
+                raw_is_bot = (row.get("is_bot") or "").strip().lower()
+                if raw_is_bot in ("1", "true", "yes", "y"):
+                    continue
+
+                username = (row.get("username") or "").strip() or None
+                users.append((user_id_int, username))
+
+            if not users:
+                await update.message.reply_text("В CSV не найдено ни одной строки с корректным `user_id`.")
+                return
+
+            chat_id = _get_chat_id(update, context)
+            chat_title = _get_chat_title_for_selected_chat_id(update, context, chat_id)
+
+            db: Database = context.bot_data.get("database")
+            if not db:
+                from config import DB_PATH
+                db = Database(DB_PATH)
+                context.bot_data["database"] = db
+
+            inserted, skipped = db.insert_user_activity_if_missing_by_user_id(chat_id=chat_id, users=users)
+            await update.message.reply_text(
+                f"Импорт в '{chat_title}' завершён.\n"
+                f"Добавлено: {inserted}\n"
+                f"Пропущено (уже были по user_id): {skipped}"
+            )
+            return
+
         # /random
         if pending == PendingAction.RANDOM:
             try:
@@ -897,3 +1327,41 @@ async def handle_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TY
     elif new_status in ("left", "kicked"):
         # Бот удален из группы
         db.remove_group(chat_id)
+
+
+async def handle_user_membership_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обновляет user_activity при входе/выходе пользователей в чате.
+    Работает по сервисным сообщениям Telegram: new_chat_members / left_chat_member.
+    """
+    if not update.message:
+        return
+
+    chat = update.effective_chat
+    if not chat or chat.type not in ("group", "supergroup"):
+        return
+
+    chat_id = chat.id
+
+    db: Database = context.bot_data.get("database")
+    if not db:
+        from config import DB_PATH
+        db = Database(DB_PATH)
+        context.bot_data["database"] = db
+
+    # Добавили новых участников
+    if update.message.new_chat_members:
+        for member in update.message.new_chat_members:
+            # ботов не учитываем
+            if getattr(member, "is_bot", False):
+                continue
+            db.upsert_user_activity(
+                chat_id=chat_id,
+                user_id=member.id,
+                username=getattr(member, "username", None),
+            )
+
+    # Кто-то вышел/его удалили
+    if update.message.left_chat_member:
+        left = update.message.left_chat_member
+        db.delete_user_activity(chat_id=chat_id, user_id=left.id)

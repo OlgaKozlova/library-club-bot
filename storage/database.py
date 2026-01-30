@@ -54,6 +54,17 @@ class Database:
                     updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_activity (
+                    chat_id           INTEGER NOT NULL,
+                    user_id           INTEGER NOT NULL,
+                    username          TEXT,
+                    first_seen_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    last_activity_at  DATETIME,
+
+                    PRIMARY KEY (chat_id, user_id)
+                )
+            """)
             # Миграция: добавляем поля position и used, если их еще нет
             try:
                 conn.execute("ALTER TABLE genres ADD COLUMN position INTEGER DEFAULT 0")
@@ -81,6 +92,168 @@ class Database:
                         WHERE id = ? AND (position = 0 OR position IS NULL)
                     """, (pos, genre_id))
             conn.commit()
+
+    def insert_user_activity_if_missing_by_user_id(
+        self,
+        chat_id: int,
+        users: List[Tuple[int, Optional[str]]],
+    ) -> Tuple[int, int]:
+        """
+        Добавляет пользователей в user_activity только если такого user_id ещё нет в таблице.
+
+        Важно: проверка делается по user_id (глобально), как требуется для /init_users.
+        Возвращает (inserted_count, skipped_count).
+        """
+        if not users:
+            return 0, 0
+
+        # Убираем дубликаты из входа (берём первый username, который встретился)
+        unique_by_id: dict[int, Optional[str]] = {}
+        for user_id, username in users:
+            if user_id not in unique_by_id:
+                unique_by_id[user_id] = username
+
+        user_ids = list(unique_by_id.keys())
+        if not user_ids:
+            return 0, 0
+
+        with sqlite3.connect(self.db_path) as conn:
+            placeholders = ",".join(["?"] * len(user_ids))
+            cursor = conn.execute(
+                f"SELECT DISTINCT user_id FROM user_activity WHERE user_id IN ({placeholders})",
+                user_ids,
+            )
+            existing_user_ids = {row[0] for row in cursor.fetchall()}
+
+            to_insert = [
+                (chat_id, user_id, unique_by_id[user_id])
+                for user_id in user_ids
+                if user_id not in existing_user_ids
+            ]
+
+            if not to_insert:
+                return 0, len(user_ids)
+
+            conn.executemany(
+                """
+                INSERT INTO user_activity (chat_id, user_id, username, first_seen_at, last_activity_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """,
+                to_insert,
+            )
+            conn.commit()
+
+            inserted = len(to_insert)
+            skipped = len(user_ids) - inserted
+            return inserted, skipped
+
+    def get_users_for_chat(
+        self,
+        chat_id: int,
+        *,
+        inactive_months: Optional[int] = None,
+    ) -> List[Tuple[int, Optional[str], Optional[str]]]:
+        """
+        Возвращает список пользователей для чата: (user_id, username, last_activity_at).
+
+        Если inactive_months задан, возвращает тех, у кого last_activity_at (или first_seen_at)
+        старше чем now - inactive_months months.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            if inactive_months is None:
+                cursor = conn.execute(
+                    """
+                    SELECT user_id, username, last_activity_at
+                    FROM user_activity
+                    WHERE chat_id = ?
+                    ORDER BY COALESCE(username, '') COLLATE NOCASE ASC, user_id ASC
+                    """,
+                    (chat_id,),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    SELECT user_id, username, last_activity_at
+                    FROM user_activity
+                    WHERE chat_id = ?
+                      AND datetime(COALESCE(last_activity_at, first_seen_at))
+                          < datetime('now', ?)
+                    ORDER BY COALESCE(username, '') COLLATE NOCASE ASC, user_id ASC
+                    """,
+                    (chat_id, f"-{inactive_months} months"),
+                )
+            return [(int(r["user_id"]), r["username"], r["last_activity_at"]) for r in cursor.fetchall()]
+
+    def delete_user_activity(self, chat_id: int, user_id: int) -> bool:
+        """Удаляет пользователя из user_activity для конкретного чата."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM user_activity
+                WHERE chat_id = ? AND user_id = ?
+                """,
+                (chat_id, user_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def clear_user_activity(self, chat_id: int) -> int:
+        """Удаляет все записи user_activity для чата. Возвращает количество удалённых строк."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM user_activity
+                WHERE chat_id = ?
+                """,
+                (chat_id,),
+            )
+            conn.commit()
+            return cursor.rowcount
+
+    def upsert_user_activity(self, chat_id: int, user_id: int, username: Optional[str]) -> None:
+        """
+        Добавляет/обновляет пользователя в user_activity для конкретного чата.
+        - first_seen_at: фиксируется при первом появлении
+        - last_activity_at: ставится в CURRENT_TIMESTAMP
+        - username: обновляется, если передан
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO user_activity (chat_id, user_id, username, first_seen_at, last_activity_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                    username = COALESCE(excluded.username, user_activity.username),
+                    last_activity_at = CURRENT_TIMESTAMP
+                """,
+                (chat_id, user_id, username),
+            )
+            conn.commit()
+
+    def upsert_user_activity_many(self, rows: List[Tuple[int, int, Optional[str]]]) -> int:
+        """
+        Пачечный апдейт last_activity_at для user_activity.
+
+        rows: список (chat_id, user_id, username)
+        Возвращает количество обработанных строк (len(rows)).
+        """
+        if not rows:
+            return 0
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO user_activity (chat_id, user_id, username, first_seen_at, last_activity_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                    username = COALESCE(excluded.username, user_activity.username),
+                    last_activity_at = CURRENT_TIMESTAMP
+                """,
+                rows,
+            )
+            conn.commit()
+        return len(rows)
 
     def add_suggestion(self, chat_id: int, user_id: int, username: Optional[str], 
                       text: str, source_message_id: int) -> bool:
