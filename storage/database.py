@@ -65,6 +65,16 @@ class Database:
                     PRIMARY KEY (chat_id, user_id)
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS history (
+                    chat_id     INTEGER NOT NULL,
+                    month_year  TEXT NOT NULL,
+                    book        TEXT,
+                    genre       TEXT,
+
+                    PRIMARY KEY (chat_id, month_year)
+                )
+            """)
             # Миграция: добавляем поля position и used, если их еще нет
             try:
                 conn.execute("ALTER TABLE genres ADD COLUMN position INTEGER DEFAULT 0")
@@ -92,6 +102,109 @@ class Database:
                         WHERE id = ? AND (position = 0 OR position IS NULL)
                     """, (pos, genre_id))
             conn.commit()
+
+    def upsert_history_book(self, chat_id: int, month_year: str, book: str) -> None:
+        """
+        Создаёт/обновляет запись истории за месяц.
+        Обновляет только поле book, не затирая genre.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO history (chat_id, month_year, book, genre)
+                VALUES (?, ?, ?, '')
+                ON CONFLICT(chat_id, month_year) DO UPDATE SET
+                    book = excluded.book
+                """,
+                (chat_id, month_year, book),
+            )
+            conn.commit()
+
+    def upsert_history_genre(self, chat_id: int, month_year: str, genre: str) -> None:
+        """
+        Создаёт/обновляет запись истории за месяц.
+        Обновляет только поле genre, не затирая book.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO history (chat_id, month_year, book, genre)
+                VALUES (?, ?, '', ?)
+                ON CONFLICT(chat_id, month_year) DO UPDATE SET
+                    genre = excluded.genre
+                """,
+                (chat_id, month_year, genre),
+            )
+            conn.commit()
+
+    def get_history_years(self, chat_id: int) -> List[int]:
+        """
+        Возвращает список лет, за которые есть записи в history для чата.
+        year извлекается из month_year формата "12_2026".
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                """
+                SELECT month_year, book, genre
+                FROM history
+                WHERE chat_id = ?
+                """,
+                (chat_id,),
+            )
+            years: set[int] = set()
+            for r in cursor.fetchall():
+                month_year = (r["month_year"] or "").strip()
+                if not month_year:
+                    continue
+                # Считаем запись "существующей", только если есть хоть что-то сохранённое
+                book = (r["book"] or "").strip()
+                genre = (r["genre"] or "").strip()
+                if not book and not genre:
+                    continue
+                try:
+                    _m, y = month_year.split("_", 1)
+                    years.add(int(y))
+                except Exception:
+                    continue
+            return sorted(years)
+
+    def get_history_for_year(self, chat_id: int, year: int) -> List[Tuple[int, str, str]]:
+        """
+        Возвращает записи истории за конкретный год.
+        Формат результата: [(month, genre, book), ...] отсортировано по month.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                """
+                SELECT month_year, book, genre
+                FROM history
+                WHERE chat_id = ?
+                """,
+                (chat_id,),
+            )
+            rows: List[Tuple[int, str, str]] = []
+            for r in cursor.fetchall():
+                month_year = (r["month_year"] or "").strip()
+                if not month_year:
+                    continue
+                try:
+                    m_str, y_str = month_year.split("_", 1)
+                    m = int(m_str)
+                    y = int(y_str)
+                except Exception:
+                    continue
+                if y != year:
+                    continue
+                book = (r["book"] or "").strip()
+                genre = (r["genre"] or "").strip()
+                # показываем только те месяцы, где есть хоть что-то
+                if not book and not genre:
+                    continue
+                rows.append((m, genre, book))
+            rows.sort(key=lambda t: t[0])
+            return rows
 
     def insert_user_activity_if_missing_by_user_id(
         self,

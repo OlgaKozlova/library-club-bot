@@ -29,3 +29,23 @@ def get_poll_month_name() -> str:
         month_name = month_names.get(current_month, "месяца")
     
     return month_name
+
+
+def get_poll_month_year_key() -> str:
+    """
+    Ключ для истории по месяцу/году.
+    С 1 по 15 число - текущий месяц, с 16 по конец месяца - следующий месяц.
+    Формат: "12_2026" (без ведущего нуля у месяца).
+    """
+    now = datetime.now()
+    day = now.day
+    month = now.month
+    year = now.year
+
+    if day >= 16:
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+
+    return f"{month}_{year}"

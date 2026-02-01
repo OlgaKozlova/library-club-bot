@@ -19,6 +19,7 @@ from telegram.error import BadRequest, Forbidden
 from services.book_service import BookService
 from services.genre_service import GenreService
 from storage.database import Database
+from utils import get_poll_month_year_key
 
 
 # ====== user_activity batching ======
@@ -166,6 +167,10 @@ class UI:
     ADD_GENRE_PROMPT: str = "Введите название жанра:"
     DELETE_GENRE_PROMPT: str = "Введите номер жанра для удаления:"
     ACTIVE_GENRE_PROMPT: str = "Какой жанр сделать (не)активным?"
+    SAVE_BOOK_PROMPT: str = "Какую книгу сохранить в историю? (номер из списка или 'номер ММ-ГГГГ')"
+    SAVE_GENRE_PROMPT: str = "Какой жанр сохранить в историю? (номер из списка или 'номер ММ-ГГГГ')"
+    HISTORY_EMPTY: str = "История пуста"
+    HISTORY_SELECT_YEAR: str = "Выберите год:"
     INIT_USERS_PROMPT: str = (
         "Пришлите CSV со строкой заголовка (как в members.*.csv).\n"
         "Можно просто вставить текст CSV сюда.\n\n"
@@ -191,6 +196,21 @@ class UI:
 
 ui = UI()
 
+MONTHS_RU_NOMINATIVE = {
+    1: "Январь",
+    2: "Февраль",
+    3: "Март",
+    4: "Апрель",
+    5: "Май",
+    6: "Июнь",
+    7: "Июль",
+    8: "Август",
+    9: "Сентябрь",
+    10: "Октябрь",
+    11: "Ноябрь",
+    12: "Декабрь",
+}
+
 
 # ====== Состояния (вместо сравнения reply_to_message.text) ======
 
@@ -201,6 +221,8 @@ class PendingAction:
     ADD_GENRE = "add_genre"
     DELETE_GENRE = "delete_genre"
     ACTIVE_GENRE = "active_genre"
+    SAVE_BOOK = "save_book"
+    SAVE_GENRE = "save_genre"
     INIT_USERS = "init_users"
 
 
@@ -286,7 +308,6 @@ async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 async def _is_admin_or_private(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return _is_private(update) or await _is_admin(update, context)
 
-
 async def _is_admin_in_chat(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -351,6 +372,46 @@ def _parse_range(text: str) -> Tuple[int, int]:
     if a > b:
         a, b = b, a
     return a, b
+
+
+def _parse_index_and_optional_month_year(text: str, *, cmd: str) -> Tuple[int, str]:
+    """
+    Поддерживаем ввод:
+    - "1" -> индекс=1, month_year = ключ текущего месяца/года (логика как в опросах)
+    - "2 01-2026" -> индекс=2, month_year="1_2026"
+    """
+    parts = [p for p in text.strip().split() if p]
+    if not parts:
+        raise ValueError(ui.ERR_EMPTY.format(cmd=cmd))
+
+    try:
+        idx = int(parts[0])
+    except ValueError:
+        raise ValueError(ui.ERR_NOT_NUMBER.format(cmd=cmd))
+    if idx < 1:
+        raise ValueError(ui.ERR_POSITIVE.format(cmd=cmd))
+
+    if len(parts) == 1:
+        return idx, get_poll_month_year_key()
+
+    if len(parts) != 2:
+        raise ValueError(ui.ERR_BAD_FORMAT)
+
+    raw = parts[1]
+    # ожидаем MM-YYYY
+    try:
+        mm_str, yyyy_str = raw.split("-", 1)
+        mm = int(mm_str)
+        yyyy = int(yyyy_str)
+    except Exception:
+        raise ValueError(ui.ERR_BAD_FORMAT)
+
+    if mm < 1 or mm > 12:
+        raise ValueError(ui.ERR_BAD_FORMAT)
+    if yyyy < 1970 or yyyy > 3000:
+        raise ValueError(ui.ERR_BAD_FORMAT)
+
+    return idx, f"{mm}_{yyyy}"
 
 
 def _validate_text(text: str, *, max_len: int, cmd: str) -> Optional[str]:
@@ -494,6 +555,129 @@ async def resetgenres_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         "Вы уверены, что хотите перевести все жанры в активное состояние?",
         reply_markup=keyboard,
     )
+
+
+async def save_book_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    chat_id = _get_chat_id(update, context)
+    if not await _is_admin_or_private_for_chat_id(update, context, chat_id):
+        await update.message.reply_text(ui.ERR_ADMIN_ONLY)
+        return
+
+    service: BookService = context.bot_data["book_service"]
+    if not service.has_books(chat_id):
+        await update.message.reply_text(ui.LIST_EMPTY)
+        return
+
+    prompt_text = f"{service.list_books(chat_id)}\n\n{ui.SAVE_BOOK_PROMPT}"
+    sent = await update.message.reply_text(prompt_text, reply_markup=ForceReply(selective=True))
+    _set_pending(context, PendingAction.SAVE_BOOK, sent.message_id)
+
+
+async def save_genre_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    chat_id = _get_chat_id(update, context)
+    if not await _is_admin_or_private_for_chat_id(update, context, chat_id):
+        await update.message.reply_text(ui.ERR_ADMIN_ONLY)
+        return
+
+    db: Database = context.bot_data.get("database")
+    if not db:
+        from config import DB_PATH
+        db = Database(DB_PATH)
+        context.bot_data["database"] = db
+
+    if not db.get_genres(chat_id):
+        await update.message.reply_text("Список жанров пуст")
+        return
+
+    service: GenreService = context.bot_data["genre_service"]
+    text = service.list_genres(chat_id)
+
+    prompt_text = f"{text}\n\n{ui.SAVE_GENRE_PROMPT}"
+    sent = await update.message.reply_text(prompt_text, reply_markup=ForceReply(selective=True))
+    _set_pending(context, PendingAction.SAVE_GENRE, sent.message_id)
+
+
+def _history_years_keyboard(years: List[int]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    for y in years:
+        rows.append([InlineKeyboardButton(str(y), callback_data=f"history:year:{y}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    chat_id = _get_chat_id(update, context)
+    if not await _is_admin_or_private_for_chat_id(update, context, chat_id):
+        await update.message.reply_text(ui.ERR_ADMIN_ONLY)
+        return
+
+    db: Database = context.bot_data.get("database")
+    if not db:
+        from config import DB_PATH
+        db = Database(DB_PATH)
+        context.bot_data["database"] = db
+
+    years = db.get_history_years(chat_id)
+    if not years:
+        await update.message.reply_text(ui.HISTORY_EMPTY)
+        return
+
+    await update.message.reply_text(ui.HISTORY_SELECT_YEAR, reply_markup=_history_years_keyboard(years))
+
+
+async def handle_history_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+
+    await query.answer()
+
+    chat_id = _get_chat_id(update, context)
+    if not await _is_admin_or_private_for_chat_id(update, context, chat_id):
+        await query.edit_message_text(ui.ERR_ADMIN_ONLY)
+        return
+
+    data = getattr(query, "data", None) or ""
+    parts = data.split(":")
+    if len(parts) != 3 or parts[0] != "history" or parts[1] != "year":
+        return
+
+    try:
+        year = int(parts[2])
+    except ValueError:
+        return
+
+    db: Database = context.bot_data.get("database")
+    if not db:
+        from config import DB_PATH
+        db = Database(DB_PATH)
+        context.bot_data["database"] = db
+
+    rows = db.get_history_for_year(chat_id, year)
+    if not rows:
+        years = db.get_history_years(chat_id)
+        if not years:
+            await query.edit_message_text(ui.HISTORY_EMPTY)
+            return
+        await query.edit_message_text(ui.HISTORY_SELECT_YEAR, reply_markup=_history_years_keyboard(years))
+        return
+
+    lines: List[str] = []
+    for month, genre, book in rows:
+        month_name = MONTHS_RU_NOMINATIVE.get(month, str(month))
+        g = genre if genre else "—"
+        b = book if book else "—"
+        lines.append(f"{month_name} - {g} - {b}")
+
+    await query.edit_message_text("\n".join(lines))
 
 
 async def chats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1074,6 +1258,62 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(msg)
             return
 
+        # /save_book
+        if pending == PendingAction.SAVE_BOOK:
+            if not await _is_admin_or_private_for_chat_id(update, context, chat_id):
+                await update.message.reply_text(ui.ERR_ADMIN_ONLY)
+                return
+
+            try:
+                idx, month_year = _parse_index_and_optional_month_year(text, cmd="/save_book")
+            except ValueError as e:
+                await update.message.reply_text(str(e))
+                return
+
+            db: Database = context.bot_data.get("database")
+            if not db:
+                from config import DB_PATH
+                db = Database(DB_PATH)
+                context.bot_data["database"] = db
+
+            book = db.get_suggestion_by_index(chat_id, idx)
+            if not book:
+                await update.message.reply_text(f"Книга с номером {idx} не найдена")
+                return
+
+            _suggestion_id, _user_id, _username, book_text, _source_message_id, _created_at = book
+            db.upsert_history_book(chat_id=chat_id, month_year=month_year, book=book_text)
+            await update.message.reply_text(f"Сохранил книгу в историю за {month_year}: {book_text}")
+            return
+
+        # /save_genre
+        if pending == PendingAction.SAVE_GENRE:
+            if not await _is_admin_or_private_for_chat_id(update, context, chat_id):
+                await update.message.reply_text(ui.ERR_ADMIN_ONLY)
+                return
+
+            try:
+                idx, month_year = _parse_index_and_optional_month_year(text, cmd="/save_genre")
+            except ValueError as e:
+                await update.message.reply_text(str(e))
+                return
+
+            db: Database = context.bot_data.get("database")
+            if not db:
+                from config import DB_PATH
+                db = Database(DB_PATH)
+                context.bot_data["database"] = db
+
+            genre = db.get_genre_by_index(chat_id, idx)
+            if not genre:
+                await update.message.reply_text(f"Жанр с номером {idx} не найден")
+                return
+
+            _genre_id, genre_title, _created_at, _source_message_id, _position, _used = genre
+            db.upsert_history_genre(chat_id=chat_id, month_year=month_year, genre=genre_title)
+            await update.message.reply_text(f"Сохранил жанр в историю за {month_year}: {genre_title}")
+            return
+
     finally:
         # очищаем состояние даже если что-то упало внутри
         _clear_pending(context)
@@ -1133,6 +1373,28 @@ async def handle_books_callbacks(update: Update, context: ContextTypes.DEFAULT_T
         return
 
 
+async def _send_books_like_vote(
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    month_name: str,
+    book_titles: List[str],
+) -> None:
+    """
+    Фолбэк вместо стандартного Poll, когда вариантов > 12.
+    Отправляет каждую книгу отдельным сообщением, чтобы пользователи голосовали реакциями 👍.
+    """
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"Книга {month_name}: вариантов больше 12, поэтому голосуем лайками 👍.\n"
+        ),
+    )
+    for i, title in enumerate(book_titles, 1):
+        await context.bot.send_message(chat_id=chat_id, text=f"{i}. {title}")
+        # маленькая пауза, чтобы снизить риск флуда в чате
+        await asyncio.sleep(0.05)
+
+
 async def pollbook_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -1146,8 +1408,19 @@ async def pollbook_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if len(book_titles) > 12:
+        keyboard = InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton("Подтвердить", callback_data="poll:book:confirm"),
+                InlineKeyboardButton("Отмена", callback_data="poll:book:cancel"),
+            ]]
+        )
+
+        question_preview = f"Книга {month_name} (лайки 👍)"
         await update.message.reply_text(
-            f"Слишком много книг в списке ({len(book_titles)}). Максимум 12 вариантов для опроса."
+            f"В списке {len(book_titles)} книг — это больше 12, поэтому классический опрос создать нельзя.\n"
+            f"Сделать голосование лайками (каждая книга отдельным сообщением)?\n\n"
+            f"Создать '{question_preview}'?",
+            reply_markup=keyboard,
         )
         return
 
@@ -1183,9 +1456,8 @@ async def handle_poll_callbacks(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(ui.LIST_EMPTY)
             return
         if len(book_titles) > 12:
-            await query.edit_message_text(
-                f"Слишком много книг в списке ({len(book_titles)}). Максимум 12 вариантов для опроса."
-            )
+            await query.delete_message()
+            await _send_books_like_vote(chat_id=chat_id, context=context, month_name=month_name, book_titles=book_titles)
             return
 
         question = f"Книга {month_name}?"

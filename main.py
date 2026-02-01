@@ -39,6 +39,10 @@ from handlers.commands import (
     deletegenre_command,
     activegenre_command,
     resetgenres_command,
+    save_book_command,
+    save_genre_command,
+    history_command,
+    handle_history_callbacks,
     handle_reply,
     handle_books_callbacks,
     pollbook_command,
@@ -85,6 +89,9 @@ async def post_init(app: Application):
     bot_deletegenre_command = BotCommand("deletegenre", "Удалить жанр")
     bot_activegenre_command = BotCommand("activegenre", "Изменить активность жанра")
     bot_resetgenres_command = BotCommand("resetgenres", "Сбросить все жанры в активное состояние")
+    bot_save_book_command = BotCommand("save_book", "Сохранить книгу в историю (месяц)")
+    bot_save_genre_command = BotCommand("save_genre", "Сохранить жанр в историю (месяц)")
+    bot_history_command = BotCommand("history", "История (книга/жанр по месяцам)")
 
     # Команды для обычных пользователей в групповых чатах
     user_commands = [
@@ -110,6 +117,9 @@ async def post_init(app: Application):
         bot_deletegenre_command,
         bot_activegenre_command,
         bot_resetgenres_command,
+        bot_save_book_command,
+        bot_save_genre_command,
+        bot_history_command,
         bot_pollbook_command,
         bot_pollgenre_command,
     ]
@@ -127,6 +137,9 @@ async def post_init(app: Application):
         bot_deletegenre_command,
         bot_activegenre_command,
         bot_resetgenres_command,
+        bot_save_book_command,
+        bot_save_genre_command,
+        bot_history_command,
         bot_chats_command,
         bot_init_users_command,
         bot_users_command,
@@ -150,6 +163,9 @@ def main():
     application.add_handler(CommandHandler("deletegenre", deletegenre_command))
     application.add_handler(CommandHandler("activegenre", activegenre_command))
     application.add_handler(CommandHandler("resetgenres", resetgenres_command))
+    application.add_handler(CommandHandler("save_book", save_book_command))
+    application.add_handler(CommandHandler("save_genre", save_genre_command))
+    application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("pollbook", pollbook_command))
     application.add_handler(CommandHandler("pollgenre", pollgenre_command))
     application.add_handler(CommandHandler("chats", chats_command))
@@ -162,6 +178,7 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_poll_callbacks, pattern=r"^poll:"))
     application.add_handler(CallbackQueryHandler(handle_chats_callbacks, pattern=r"^chats:"))
     application.add_handler(CallbackQueryHandler(handle_users_callbacks, pattern=r"^users:"))
+    application.add_handler(CallbackQueryHandler(handle_history_callbacks, pattern=r"^history:"))
 
     # Reply (ForceReply). Должен быть после команд, чтобы не перехватывать команды.
     application.add_handler(MessageHandler(filters.TEXT & filters.REPLY, handle_reply))
