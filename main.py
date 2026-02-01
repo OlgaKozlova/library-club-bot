@@ -26,6 +26,10 @@ from config import BOT_TOKEN, DB_PATH
 from storage.database import Database
 from services.book_service import BookService
 from services.genre_service import GenreService
+from services.history_service import HistoryService
+from services.chats_service import ChatsService
+from services.users_service import UsersService
+from services.groups_service import GroupsService
 
 from handlers.commands import (
     suggest_command,
@@ -68,6 +72,10 @@ async def post_init(app: Application):
     app.bot_data["database"] = db
     app.bot_data["book_service"] = BookService(db)
     app.bot_data["genre_service"] = GenreService(db)
+    app.bot_data["history_service"] = HistoryService(db)
+    app.bot_data["chats_service"] = ChatsService(db)
+    app.bot_data["users_service"] = UsersService(db)
+    app.bot_data["groups_service"] = GroupsService(db)
 
     # Flush активности пользователей раз в минуту (батч в SQLite) без JobQueue
     start_user_activity_flush_loop(app, interval_seconds=60)
