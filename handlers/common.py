@@ -1,3 +1,4 @@
+import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -92,7 +93,12 @@ class PendingAction:
 
 USER_DATA_KEY = "pending_action"
 USER_DATA_PROMPT_MSG_ID = "pending_prompt_message_id"
+USER_DATA_PENDING_AT = "pending_action_at"
+USER_DATA_PENDING_RESET_JOB = "pending_reset_job"
 USER_DATA_SELECTED_CHAT_ID = "selected_chat_id"
+
+# Таймаут ожидания ответа на ForceReply (секунды). По истечении — ожидание сбрасывается по таймеру.
+PENDING_REPLY_TIMEOUT_SEC = 300  # 5 минут
 
 
 # ====== Вспомогательные функции ======
@@ -197,14 +203,69 @@ async def _is_admin_or_private_for_chat_id(
     return await _is_admin_for_chat_id(update, context, chat_id)
 
 
-def _set_pending(context: ContextTypes.DEFAULT_TYPE, action: str, prompt_message_id: int) -> None:
+async def _clear_pending_timeout_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сбрасывает pending по таймеру (вызывается через JobQueue через 5 минут)."""
+    job = context.job
+    if not job or not job.data:
+        return
+    user_id = job.data.get("user_id")
+    if user_id is None:
+        return
+    user_data = context.application.user_data.get(user_id)
+    if not user_data:
+        return
+    user_data.pop(USER_DATA_KEY, None)
+    user_data.pop(USER_DATA_PROMPT_MSG_ID, None)
+    user_data.pop(USER_DATA_PENDING_AT, None)
+    user_data.pop(USER_DATA_PENDING_RESET_JOB, None)
+
+
+def _set_pending(
+    context: ContextTypes.DEFAULT_TYPE,
+    action: str,
+    prompt_message_id: int,
+    user_id: int,
+) -> None:
     context.user_data[USER_DATA_KEY] = action
     context.user_data[USER_DATA_PROMPT_MSG_ID] = prompt_message_id
+    context.user_data[USER_DATA_PENDING_AT] = time.time()
+
+    job_queue = getattr(context.application, "job_queue", None)
+    if job_queue:
+        old_job = context.user_data.pop(USER_DATA_PENDING_RESET_JOB, None)
+        if old_job:
+            try:
+                old_job.schedule_removal()
+            except Exception:
+                pass
+        new_job = job_queue.run_once(
+            _clear_pending_timeout_callback,
+            when=PENDING_REPLY_TIMEOUT_SEC,
+            data={"user_id": user_id},
+            name=f"pending_reset_{user_id}",
+        )
+        context.user_data[USER_DATA_PENDING_RESET_JOB] = new_job
 
 
 def _clear_pending(context: ContextTypes.DEFAULT_TYPE) -> None:
+    old_job = context.user_data.pop(USER_DATA_PENDING_RESET_JOB, None)
+    if old_job:
+        try:
+            old_job.schedule_removal()
+        except Exception:
+            pass
     context.user_data.pop(USER_DATA_KEY, None)
     context.user_data.pop(USER_DATA_PROMPT_MSG_ID, None)
+    context.user_data.pop(USER_DATA_PENDING_AT, None)
+
+
+def _is_pending_expired(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True, если ожидание ответа (ForceReply) истекло (прошло более PENDING_REPLY_TIMEOUT_SEC)."""
+    pending_at = context.user_data.get(USER_DATA_PENDING_AT)
+    if pending_at is None:
+        # Старые данные без метки времени считаем истёкшими
+        return True
+    return (time.time() - pending_at) > PENDING_REPLY_TIMEOUT_SEC
 
 
 def _get_pending(context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:

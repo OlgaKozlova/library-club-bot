@@ -37,7 +37,7 @@ async def addgenre_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sent = await update.message.reply_text(ui.ADD_GENRE_PROMPT, reply_markup=ForceReply(selective=True))
-    _set_pending(context, PendingAction.ADD_GENRE, sent.message_id)
+    _set_pending(context, PendingAction.ADD_GENRE, sent.message_id, update.effective_user.id)
 
 
 async def deletegenre_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -50,7 +50,7 @@ async def deletegenre_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     sent = await update.message.reply_text(ui.DELETE_GENRE_PROMPT, reply_markup=ForceReply(selective=True))
-    _set_pending(context, PendingAction.DELETE_GENRE, sent.message_id)
+    _set_pending(context, PendingAction.DELETE_GENRE, sent.message_id, update.effective_user.id)
 
 
 async def activegenre_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -63,7 +63,7 @@ async def activegenre_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     sent = await update.message.reply_text(ui.ACTIVE_GENRE_PROMPT, reply_markup=ForceReply(selective=True))
-    _set_pending(context, PendingAction.ACTIVE_GENRE, sent.message_id)
+    _set_pending(context, PendingAction.ACTIVE_GENRE, sent.message_id, update.effective_user.id)
 
 async def resetgenres_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:

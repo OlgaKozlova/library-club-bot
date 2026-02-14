@@ -20,7 +20,7 @@ async def suggest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sent = await update.message.reply_text(ui.SUGGEST_PROMPT, reply_markup=ForceReply(selective=True))
-    _set_pending(context, PendingAction.SUGGEST, sent.message_id)
+    _set_pending(context, PendingAction.SUGGEST, sent.message_id, update.effective_user.id)
 
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -63,7 +63,7 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sent = await update.message.reply_text(ui.DELETE_BOOK_PROMPT, reply_markup=ForceReply(selective=True))
-    _set_pending(context, PendingAction.DELETE_BOOK, sent.message_id)
+    _set_pending(context, PendingAction.DELETE_BOOK, sent.message_id, update.effective_user.id)
 
 
 async def random_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -71,7 +71,7 @@ async def random_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sent = await update.message.reply_text(ui.RANDOM_PROMPT, reply_markup=ForceReply(selective=True))
-    _set_pending(context, PendingAction.RANDOM, sent.message_id)
+    _set_pending(context, PendingAction.RANDOM, sent.message_id, update.effective_user.id)
 
 
 async def choose_book_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

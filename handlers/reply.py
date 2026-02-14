@@ -16,6 +16,7 @@ from handlers.common import (
     _get_chat_title_for_selected_chat_id,
     _get_pending,
     _is_admin_or_private_for_chat_id,
+    _is_pending_expired,
     _parse_index_and_optional_month_year,
     _parse_range,
     _validate_text,
@@ -40,6 +41,11 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     pending = _get_pending(context)
     if not pending:
+        return
+
+    # Ответ ожидается в течение 5 минут; по истечении — сбрасываем ожидание
+    if _is_pending_expired(context):
+        _clear_pending(context)
         return
 
     prompt_msg_id = context.user_data.get(USER_DATA_PROMPT_MSG_ID)

@@ -26,7 +26,7 @@ async def init_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     sent = await update.message.reply_text(ui.INIT_USERS_PROMPT, reply_markup=ForceReply(selective=True))
-    _set_pending(context, PendingAction.INIT_USERS, sent.message_id)
+    _set_pending(context, PendingAction.INIT_USERS, sent.message_id, update.effective_user.id)
 
 
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

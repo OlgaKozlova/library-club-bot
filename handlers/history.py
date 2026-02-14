@@ -31,7 +31,7 @@ async def save_book_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prompt_text = f"{service.list_books(chat_id)}\n\n{ui.SAVE_BOOK_PROMPT}"
     sent = await update.message.reply_text(prompt_text, reply_markup=ForceReply(selective=True))
-    _set_pending(context, PendingAction.SAVE_BOOK, sent.message_id)
+    _set_pending(context, PendingAction.SAVE_BOOK, sent.message_id, update.effective_user.id)
 
 
 async def save_genre_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -53,7 +53,7 @@ async def save_genre_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     prompt_text = f"{text}\n\n{ui.SAVE_GENRE_PROMPT}"
     sent = await update.message.reply_text(prompt_text, reply_markup=ForceReply(selective=True))
-    _set_pending(context, PendingAction.SAVE_GENRE, sent.message_id)
+    _set_pending(context, PendingAction.SAVE_GENRE, sent.message_id, update.effective_user.id)
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
